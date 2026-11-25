@@ -32,6 +32,57 @@ logical permission.
 """
 
 
+def _row_sources(row):
+    """Return the provenance values carried by a record or canonical grant."""
+    if "sources" in row:
+        return list(row["sources"])
+    return [row["source"]]
+
+
+def _canonical_grants(rows):
+    """Merge rows into canonical grants, one per logical permission.
+
+    Rows may be permission records (``source``) or canonical grants
+    (``sources``).  Sources are merged per ``(principal, resource, action)``
+    identity, deduplicated and sorted.  The result is sorted by logical
+    identity.
+    """
+    merged = {}
+    for row in rows:
+        key = (row["principal"], row["resource"], row["action"])
+        merged.setdefault(key, set()).update(_row_sources(row))
+    result = []
+    for principal, resource, action in sorted(merged):
+        result.append(
+            {
+                "principal": principal,
+                "resource": resource,
+                "action": action,
+                "sources": sorted(merged[(principal, resource, action)]),
+            }
+        )
+    return result
+
+
+def _source_sets(snapshot):
+    """Map each logical permission in a snapshot to its set of sources."""
+    result = {}
+    for row in snapshot["grants"]:
+        key = (row["principal"], row["resource"], row["action"])
+        result.setdefault(key, set()).add(row["source"])
+    return result
+
+
+def _canonical_from(key, sources):
+    principal, resource, action = key
+    return {
+        "principal": principal,
+        "resource": resource,
+        "action": action,
+        "sources": sorted(sources),
+    }
+
+
 def load_snapshot(records) -> dict:
     """Build the principal and resource indexes for one permission snapshot.
 
@@ -53,7 +104,56 @@ def load_snapshot(records) -> dict:
     reporting functions.  The returned containers and lists are new; input
     records and the input sequence are not mutated.
     """
-    raise NotImplementedError
+    # Defect 1 fix: keep every distinct row; both indexes are lists keyed by
+    # principal/resource, so one resource can never overwrite another.
+    seen = set()
+    rows = []
+    for record in records:
+        row = dict(record)
+        key = (
+            row["principal"],
+            row["resource"],
+            row["action"],
+            row["source"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+
+    grants = sorted(
+        rows,
+        key=lambda r: (
+            r["principal"],
+            r["resource"],
+            r["action"],
+            r["source"],
+        ),
+    )
+
+    by_principal = {}
+    for row in grants:
+        by_principal.setdefault(row["principal"], []).append(row)
+    for principal, principal_rows in by_principal.items():
+        by_principal[principal] = sorted(
+            principal_rows,
+            key=lambda r: (r["resource"], r["action"], r["source"]),
+        )
+
+    by_resource = {}
+    for row in grants:
+        by_resource.setdefault(row["resource"], []).append(row)
+    for resource, resource_rows in by_resource.items():
+        by_resource[resource] = sorted(
+            resource_rows,
+            key=lambda r: (r["principal"], r["action"], r["source"]),
+        )
+
+    return {
+        "grants": grants,
+        "by_principal": by_principal,
+        "by_resource": by_resource,
+    }
 
 
 def diff_snapshots(old, new) -> dict:
@@ -74,7 +174,28 @@ def diff_snapshots(old, new) -> dict:
     unique ``sources``.  If the snapshots describe the same permissions with
     the same sources, all three lists are empty.
     """
-    raise NotImplementedError
+    # Defect 2 fix: report removals and source changes as well as additions,
+    # keying the comparison on the logical permission rather than on rows.
+    old_sources = _source_sets(old)
+    new_sources = _source_sets(new)
+
+    added = []
+    removed = []
+    changed = []
+    for key in sorted(set(old_sources) | set(new_sources)):
+        if key not in old_sources:
+            added.append(_canonical_from(key, new_sources[key]))
+        elif key not in new_sources:
+            removed.append(_canonical_from(key, old_sources[key]))
+        elif old_sources[key] != new_sources[key]:
+            changed.append(
+                {
+                    "before": _canonical_from(key, old_sources[key]),
+                    "after": _canonical_from(key, new_sources[key]),
+                }
+            )
+
+    return {"added": added, "removed": removed, "changed": changed}
 
 
 def orphan_grants(snapshot, directory) -> list:
@@ -90,7 +211,14 @@ def orphan_grants(snapshot, directory) -> list:
     with merged, sorted, unique sources.  Results are sorted by
     ``(principal, resource, action)``.  The snapshot is not mutated.
     """
-    raise NotImplementedError
+    # Defect 3 fix: consult the directory status instead of only testing for
+    # an empty principal; departed and unknown principals are orphaned too.
+    findings = []
+    for grant in _canonical_grants(snapshot["grants"]):
+        entry = directory.get(grant["principal"])
+        if not isinstance(entry, dict) or entry.get("status") != "active":
+            findings.append(grant)
+    return findings
 
 
 def high_risk(grants, rules) -> list:
@@ -109,7 +237,18 @@ def high_risk(grants, rules) -> list:
     merged, sorted and unique.  Results are sorted by
     ``(principal, resource, action)``.
     """
-    raise NotImplementedError
+    # Defects 4 and 5 fix: match on exact (resource, action) pairs only, so
+    # prefix resources and read-only actions are never treated as high risk.
+    rule_pairs = {(rule["resource"], rule["action"]) for rule in rules}
+
+    matched = {}
+    for grant in grants:
+        if (grant["resource"], grant["action"]) not in rule_pairs:
+            continue
+        key = (grant["principal"], grant["resource"], grant["action"])
+        matched.setdefault(key, set()).update(_row_sources(grant))
+
+    return [_canonical_from(key, sources) for key, sources in sorted(matched.items())]
 
 
 def approval_valid(grant, approvals, now, ttl) -> bool:
@@ -125,7 +264,22 @@ def approval_valid(grant, approvals, now, ttl) -> bool:
     valid approval is sufficient.  Missing, expired, future-dated and
     out-of-scope approvals do not make the grant valid.
     """
-    raise NotImplementedError
+    # Defects 6 and 7 fix: require an exact three-dimensional scope match plus
+    # a fresh, in-window issued_at; expired, future-dated and scoped-to-elsewhere
+    # approvals are all rejected.
+    for approval in approvals:
+        if (
+            approval["principal"] != grant["principal"]
+            or approval["resource"] != grant["resource"]
+            or approval["action"] != grant["action"]
+        ):
+            continue
+        issued_at = approval["issued_at"]
+        if isinstance(issued_at, bool) or not isinstance(issued_at, int):
+            continue
+        if now - ttl <= issued_at <= now:
+            return True
+    return False
 
 
 def review(snapshot, directory, policy, now) -> dict:
@@ -151,7 +305,36 @@ def review(snapshot, directory, policy, now) -> dict:
     appear in more than one category, but it appears at most once per category.
     Multiple source rows for one permission never inflate a list or a count.
     """
-    raise NotImplementedError
+    # Defect 8 fix: every category is built from canonical grants, so one
+    # logical permission is counted once regardless of its source rows.
+    grants = _canonical_grants(snapshot["grants"])
+    approvals = policy.get("approvals", [])
+    ttl = policy["approval_ttl"]
+
+    if policy.get("check_orphans") is True:
+        orphans = orphan_grants(snapshot, directory)
+    else:
+        orphans = []
+
+    risky = high_risk(grants, policy["high_risk_rules"])
+
+    unapproved = [
+        grant
+        for grant in grants
+        if not approval_valid(grant, approvals, now, ttl)
+    ]
+
+    return {
+        "orphans": orphans,
+        "high_risk": risky,
+        "unapproved": unapproved,
+        "counts": {
+            "grants": len(grants),
+            "orphans": len(orphans),
+            "high_risk": len(risky),
+            "unapproved": len(unapproved),
+        },
+    }
 
 
 def validate_policy(policy) -> list[str]:
@@ -170,7 +353,26 @@ def validate_policy(policy) -> list[str]:
     without a positive approval lifetime or without orphan checking must never
     pass, because the review would silently omit a required control.
     """
-    raise NotImplementedError
+    # Defect 9 fix: high-risk rule configuration is itself a required control
+    # and is validated alongside the ttl and orphan-check settings.
+    problems = []
+
+    rules = policy.get("high_risk_rules")
+    if (
+        isinstance(rules, (str, bytes))
+        or not isinstance(rules, (list, tuple))
+        or len(rules) == 0
+    ):
+        problems.append("missing high risk rules")
+
+    ttl = policy.get("approval_ttl")
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        problems.append("missing approval ttl")
+
+    if policy.get("check_orphans") is not True:
+        problems.append("orphan check disabled")
+
+    return problems
 
 
 def review_batch(batches, policy, now) -> dict:
@@ -191,4 +393,19 @@ def review_batch(batches, policy, now) -> dict:
 
     Each batch value has exactly the shape returned by :func:`review`.
     """
-    raise NotImplementedError
+    # Defect 10 fix: each batch gets a freshly loaded snapshot and its own
+    # directory; no index or principal set is reused across batches.
+    batch_results = {}
+    totals = {"grants": 0, "orphans": 0, "high_risk": 0, "unapproved": 0}
+
+    for batch in batches:
+        snapshot = load_snapshot(batch["records"])
+        result = review(snapshot, batch["directory"], policy, now)
+        batch_results[batch["id"]] = result
+        for key in totals:
+            totals[key] += result["counts"][key]
+
+    return {
+        "batches": batch_results,
+        "counts": {"batches": len(batch_results), **totals},
+    }
